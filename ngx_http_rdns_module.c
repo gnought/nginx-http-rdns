@@ -79,6 +79,9 @@ typedef struct {
     ngx_int_t rdns_result_index;
     ngx_http_rdns_common_conf_t conf;
 
+    ngx_array_t  * proxies;    /* array of ngx_cidr_t */
+    ngx_flag_t    proxy_recursive;
+
 #if (NGX_PCRE)
     ngx_array_t * rules;
 #endif
@@ -110,7 +113,8 @@ static ngx_int_t                     var_rdns_result_getter(ngx_http_request_t *
 static ngx_flag_t                    var_set(ngx_http_request_t * r, ngx_int_t index, ngx_str_t value);
 static ngx_http_rdns_ctx_t *         create_context(ngx_http_request_t * r);
 static ngx_http_rdns_common_conf_t * rdns_get_common_conf(ngx_http_rdns_ctx_t * ctx, ngx_http_rdns_loc_conf_t * loc_cf);
-
+static char *                        rdns_proxy_directive(ngx_conf_t * cf, ngx_command_t * cmd,void * conf);
+static ngx_int_t                     rdns_cidr_value(ngx_conf_t * cf, ngx_str_t * net, ngx_cidr_t * cidr);
 
 static ngx_command_t  ngx_http_rdns_commands[] = {
 
@@ -123,6 +127,20 @@ static ngx_command_t  ngx_http_rdns_commands[] = {
       rdns_directive,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
+      NULL },
+
+    { ngx_string("rdns_proxy"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      rdns_proxy_directive,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("rdns_proxy_recursive"),
+      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_rdns_loc_conf_t, proxy_recursive),
       NULL },
 
 #if (NGX_PCRE)
@@ -186,6 +204,7 @@ static void * create_loc_conf(ngx_conf_t * cf) {
         conf->conf.enabled = NGX_CONF_UNSET;
         conf->conf.double_mode = NGX_CONF_UNSET;
         conf->rdns_result_index = NGX_CONF_UNSET;
+        conf->proxy_recursive = NGX_CONF_UNSET;
     }
 
     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "(DONE) creating location conf = %p");
@@ -205,8 +224,15 @@ static char * merge_loc_conf(ngx_conf_t * cf, void * parent, void * child) {
 
     ngx_conf_merge_value(conf->conf.enabled, prev->conf.enabled, 0);
     ngx_conf_merge_value(conf->conf.double_mode, prev->conf.double_mode, 0);
+    ngx_conf_merge_value(conf->proxy_recursive, prev->proxy_recursive, 0);
     ngx_conf_merge_value(conf->rdns_result_index, prev->rdns_result_index,
             ngx_http_get_variable_index(cf, (ngx_str_t *)&var_rdns_result_name));
+
+    if (conf->proxies == NULL) {
+        conf->proxies = prev->proxies;
+    }
+
+    ngx_conf_merge_value(conf->proxy_recursive, prev->proxy_recursive, 0);
 
 #if (NGX_PCRE)
     if (conf->rules == NULL) {
@@ -447,6 +473,66 @@ static char * rdns_deny_directive(ngx_conf_t * cf, ngx_command_t * cmd, void * c
 
 #endif
 
+static char * rdns_proxy_directive(ngx_conf_t * cf, ngx_command_t * cmd, void * conf) {
+    ngx_http_rdns_loc_conf_t * loc_cf = conf; 
+
+    ngx_str_t   *value;
+    ngx_cidr_t  cidr, *c;
+
+    value = cf->args->elts;
+
+    if (loc_cf == NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "internal error");
+        ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "location config NULL pointer");
+        return NGX_CONF_ERROR;
+    }
+
+    if (rdns_cidr_value(cf, &value[1], &cidr) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (loc_cf->proxies == NULL) {
+        loc_cf->proxies = ngx_array_create(cf->pool, 4, sizeof(ngx_cidr_t));
+        if (loc_cf->proxies == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    c = ngx_array_push(loc_cf->proxies);
+    if (c == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    *c = cidr;
+
+    return NGX_CONF_OK;
+}
+
+static ngx_int_t rdns_cidr_value(ngx_conf_t *cf, ngx_str_t *net, ngx_cidr_t *cidr) {
+    ngx_int_t  rc;
+
+    if (ngx_strcmp(net->data, "255.255.255.255") == 0) {
+        cidr->family = AF_INET;
+        cidr->u.in.addr = 0xffffffff;
+        cidr->u.in.mask = 0xffffffff;
+
+        return NGX_OK;
+    }
+
+    rc = ngx_ptocidr(net, cidr);
+
+    if (rc == NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid network \"%V\"", net);
+        return NGX_ERROR;
+    }
+
+    if (rc == NGX_DONE) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "low address bits of %V are meaningless", net);
+    }
+
+    return NGX_OK;
+}
 
 static ngx_int_t resolver_handler(ngx_http_request_t * r) {
     ngx_http_rdns_loc_conf_t * loc_cf = ngx_http_get_module_loc_conf(r, ngx_http_rdns_module);
@@ -454,6 +540,8 @@ static ngx_int_t resolver_handler(ngx_http_request_t * r) {
     ngx_resolver_ctx_t * rctx;
     ngx_http_rdns_ctx_t * ctx = ngx_http_get_module_ctx(r, ngx_http_rdns_module);
     ngx_http_rdns_common_conf_t * cconf;
+    ngx_addr_t           addr;
+    ngx_array_t         *xfwd;
 
 #if (OLD_RESOLVER_API)
     struct sockaddr_in * sin = (struct sockaddr_in *) r->connection->sockaddr;
@@ -515,9 +603,26 @@ static ngx_int_t resolver_handler(ngx_http_request_t * r) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
+        addr.sockaddr = r->connection->sockaddr;
+        addr.socklen = r->connection->socklen;
+
+        xfwd = &r->headers_in.x_forwarded_for;
+
+        if (xfwd->nelts > 0 && loc_cf->proxies != NULL) {
+            (void) ngx_http_get_forwarded_addr(r, &addr, xfwd, NULL,
+                                               loc_cf->proxies, loc_cf->proxy_recursive);
+        }
+
+        if (addr.sockaddr->sa_family != AF_INET) {
+            return INADDR_NONE;
+        }
+
+        sin = (struct sockaddr_in *) addr.sockaddr;
+
 #if (OLD_RESOLVER_API)
         rctx->addr = sin->sin_addr.s_addr;
         rctx->type = NGX_RESOLVE_PTR;
+
 #else
         rctx->addr.sockaddr = r->connection->sockaddr;
         rctx->addr.socklen = r->connection->socklen;

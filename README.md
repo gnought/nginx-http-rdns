@@ -1,4 +1,4 @@
-# Nginx HTTP rDNS module
+# Nginx HTTP rDNS module with x_forwarded_for header support
 
 ## Summary
 
@@ -12,8 +12,11 @@ the DNS server defined by the standard resolver directive.
 ## Example
 
     location / {
-        resolver 127.0.0.1;
-
+        resolver 8.8.8.8;
+        
+        rdns_proxy 10.132.17.146;
+        rdns_proxy_recursive on;
+        
         rdns_deny badone\.example\.com;
 
         if ($http_user_agent ~* FooAgent) {
@@ -28,7 +31,7 @@ the DNS server defined by the standard resolver directive.
     }
 
 In the example above, nginx will make a reverse DNS request (through
-the 127.0.0.1 DNS server) for each request having the "FooAgent"
+the 8.8.8.8 DNS server) for each request having the "FooAgent"
 user agent. Requests from badone.example.com will be forbidden.
 The $rdns_hostname variable will have the rDNS request result or
 "not found" (in case it's not found or any error occured) for any
@@ -78,6 +81,28 @@ executed for the second time, without any breaks. Disabling directive
 (rdns off) makes no breaks.
 
 Core module resolver should be defined to use this directive.
+
+
+### rdns_proxy
+
+* Syntax: rdns_proxy address | CIDR
+* Default: -
+* Context: http, server, location
+* Phase: rewrite
+* Variables: -
+
+Defines trusted addresses. When a request comes from a trusted address, an address from the “X-Forwarded-For” request header field will be used instead.
+
+
+### rdns_proxy_recursive
+
+* Syntax: rdns_proxy_recursive on | off
+* Default: -
+* Context: http, server, location
+* Phase: rewrite
+* Variables: -
+
+If recursive search is disabled then instead of the original client address that matches one of the trusted addresses, the last address sent in “X-Forwarded-For” will be used. If recursive search is enabled then instead of the original client address that matches one of the trusted addresses, the last non-trusted address sent in “X-Forwarded-For” will be used.
 
 
 ### rdns_allow
@@ -158,6 +183,4 @@ Dmitry Stolyarov, written by Timofey Kirillov, CJSC Flant
 ## Links
 
 * The source code on GitHub:
-  https://github.com/flant/nginx-http-rdns
-* The module homepage (in Russian):
-  http://flant.ru/projects/nginx-http-rdns
+  https://github.com/uiltondutra/nginx-http-rdns
