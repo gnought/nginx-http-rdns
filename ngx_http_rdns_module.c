@@ -621,9 +621,8 @@ static ngx_int_t resolver_handler(ngx_http_request_t * r) {
             return INADDR_NONE;
         }
 
-        sin = (struct sockaddr_in *) addr.sockaddr;
-
 #if (OLD_RESOLVER_API)
+        sin = (struct sockaddr_in *) addr.sockaddr;
         rctx->addr = sin->sin_addr.s_addr;
         rctx->type = NGX_RESOLVE_PTR;
 
